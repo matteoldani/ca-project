@@ -23,10 +23,16 @@
 // External headers
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdatomic.h>
 // Internal headers
 #include <tm.h>
 
+#include "hashmap.h"
 #include "macros.h"
+
+#define FILTERHASH(a)                   ((UNS(a) >> 2) ^ (UNS(a) >> 5))
+#define FILTERBITS(a)                   (1 << (FILTERHASH(a) & 0x1F))
+
 
 // Required data structures
 
@@ -37,7 +43,8 @@ enum states {
 };
 
 struct word_lock {
-    uint8_t     lock;   // this is the value used to check if the word is locked
+    void        *addr;   // word to be assigned to this lock
+    uint8_t     lock;    // this is the value used to check if the word is locked
     uint64_t    version; // this is the version of the word lock
 };
 
@@ -50,7 +57,6 @@ struct segment_node {
     struct segment_node     *prev;
     void                    *segment;  // Start of the shared memory region (i.e., of the non-deallocable memory segment)
     size_t                  size;      // Size of the segment  
-    struct word_lock        *word_locks; // list of all the locks required for this region    
 };
 
 /**
@@ -60,8 +66,9 @@ struct segment_node {
 struct write_set_node {
     void                    *addr; // this is the address to be read which is also used to acquire the locks
     void                    *value; // the value to be written 
-    struct write_set_node   *next; // next entry in the write set
-    struct write_set_node   *prev; // prev entry in the write set
+    uint64_t                rv;    // read version
+    uint64_t                wv;    // write version
+    struct word_lock        *word_lock_addr; // address to the word lock binded with this address 
 };
 
 /**
@@ -70,8 +77,7 @@ struct write_set_node {
  */
 struct read_set_node {
     void                    *addr; // this is the address to be read which is also used to acquire the locks
-    struct read_set_node    *next; // next entry in the write set
-    struct read_set_node    *prev; // prev entry in the write set
+    uint64_t                rv;    // read version
 };
 
 /**
@@ -79,14 +85,12 @@ struct read_set_node {
  * as required by TL2
  */
 struct transaction {
-    struct write_set_node   *ws_head; // write set head
-    struct write_set_node   *ws_tail; // write set tail
-    struct read_set_node    *rs_head; // read set head
-    struct read_set_node    *rs_tail; // read set tail
-    uint64_t                rv;       // read version
-    uint64_t                wv;       // write version
+    struct hashmap          *ws_map; // hashmap containing the write set
+    struct hashmap          *rs_map; // hashmap containing the read set
     bool                    is_ro;    // flag to set a transacrtion as readonly
-    
+    // uint64_t                bloom_filter; // bloom filert used to check if the addrs is already in the write transaction
+    enum states             state;
+    uint64_t                rv;
 };
 
 /**
@@ -99,10 +103,15 @@ struct region {
      * Shared memory segments dynamically allocated via tm_alloc  within transactions. 
      * The first segment is not deallocable and created with the creation of the region 
     */
-    struct segment_node *allocs_head;   // head of the list of the allocated segment
-    struct segment_node *allocs_tail;   // tail of the list of the allocated segment     
-    size_t              align;          // Size of a word in the shared memory region (in bytes)
-    uint64_t            global_lock;    // global version lock updated with a compare and swap
+    struct segment_node     *allocs_head;   // head of the list of the allocated segment
+    struct segment_node     *allocs_tail;   // tail of the list of the allocated segment     
+    size_t                  align;          // Size of a word in the shared memory region (in bytes)
+    atomic_uint_fast64_t    global_lock;    // global version lock updated with a compare and swap
+    struct hashmap          *word_locks;    // hashmap that maps the words allocated with thie correspondign lock
+
+
+    // TODO it might be worth saving the words which were freed so that I can easily abort a transaction
+    // which is running concurrently with a free
 };
 
 
@@ -119,6 +128,56 @@ static inline bool release_word_lock(struct word_lock *lock){
     return cas(lock->lock, 1, 0);
 }
 // END OF HELPER FUNCTIONS FOR TH WORD LOCK
+
+
+// HELPER FUNCTIONS FOR THE READ/WRITE SET HASHMAP
+
+
+int write_set_compare(const void *a, const void *b, void unused(*udata)){
+    const struct write_set_node *node_a = a;
+    const struct write_set_node *node_b = b;
+
+    if(node_a->addr > node_b->addr){return 1;}
+    else if(node_a->addr < node_b->addr){return -1;}
+    else {return 0;}
+}
+
+int read_set_compare(const void *a, const void *b, void unused(*udata)){
+    const struct read_set_node *node_a = a;
+    const struct read_set_node *node_b = b;
+
+    if(node_a->addr > node_b->addr){return 1;}
+    else if(node_a->addr < node_b->addr){return -1;}
+    else {return 0;}
+}
+
+int word_lock_compare(const void *a, const void *b, void unused(*udata)){
+    const struct word_lock *node_a = a;
+    const struct word_lock *node_b = b;
+
+    if(node_a->addr > node_b->addr){return 1;}
+    else if(node_a->addr < node_b->addr){return -1;}
+    else {return 0;}
+}
+
+
+uint64_t write_set_hash(const void *item, uint64_t seed0, uint64_t seed1){
+    const struct write_set_node *node = item;
+    return hashmap_sip(node->addr, sizeof(node->addr), seed0, seed1);
+}
+
+uint64_t read_set_hash(const void *item, uint64_t seed0, uint64_t seed1){
+    const struct read_set_node *node = item;
+    return hashmap_sip(node->addr, sizeof(node->addr), seed0, seed1);
+}
+
+uint64_t word_lock_hash(const void *item, uint64_t seed0, uint64_t seed1){
+    const struct word_lock *node = item;
+    return hashmap_sip(node->addr, sizeof(node->addr), seed0, seed1);
+}
+
+// END OF HELPER FUNCTIONS FOR THE READ/WRITE SET HASHMAP
+
 
 /** Create (i.e. allocate + init) a new shared memory region, with one first non-free-able allocated segment of the requested size and alignment.
  * @param size  Size of the first shared segment of memory to allocate (in bytes), must be a positive multiple of the alignment
@@ -138,9 +197,11 @@ shared_t tm_create(size_t size, size_t align) {
 
     region->allocs_head->next = NULL;
     region->allocs_head->prev = NULL;
-
     // TODO maybe is more helpful if this is set to null
     region->allocs_tail = region->allocs_head;
+
+    region->word_locks = hashmap_new(sizeof(struct word_lock), 0, 15, 460399, 
+                                            word_lock_hash, word_lock_compare, NULL, NULL);
 
     // We allocate the shared memory buffer such that its words are correctly
     // aligned.
@@ -150,13 +211,19 @@ shared_t tm_create(size_t size, size_t align) {
     }
 
     // Creating the word locks for this memory region
-    int n_locks = size / align;
     // use calloc to initialize all the locks
-    region->allocs_head->word_locks = (struct word_lock *) calloc(sizeof(struct word_lock), n_locks);
+    int n_locks = size / align;
+    uintptr_t base_addr = region->allocs_head->segment;
+    for(int i=0; i<n_locks; i++){
+        struct word_lock *lock = (struct word_lock *) calloc(sizeof(struct word_lock), 1);
+        lock->addr = base_addr;
+        base_addr += region->align;
+        hashmap_set(region->word_locks, lock);
+    }
 
     memset(region->allocs_head->segment, 0, size);
     region->global_lock         = 0;
-    region->allocs_head->size        = size;
+    region->allocs_head->size   = size;
     region->align               = align;
 
     return region;
@@ -174,9 +241,11 @@ void tm_destroy(shared_t shared) {
         struct segment_node * curr = region->allocs_head;
         region->allocs_head = region->allocs_head->next;
         free(curr->segment);
-        free(curr->word_locks);
         free(curr);
     }
+
+    // free the map
+    hashmap_free(region->word_locks);
 
     // I can free the region 
     free(region);
@@ -218,12 +287,18 @@ size_t tm_align(shared_t shared) {
 tx_t tm_begin(shared_t unused(shared), bool is_ro) {
 
     struct transaction *transaction = (struct transaction *)malloc(sizeof(struct transaction));
+    struct region *region = (struct region *)shared;
 
     transaction->is_ro = is_ro;
-    transaction->rs_head = NULL;
-    transaction->rs_tail = NULL;
-    transaction->ws_head = NULL;
-    transaction->ws_tail = NULL; 
+    transaction->rs_map = hashmap_new(sizeof(struct read_set_node), 0, 15, 460399,
+                                            read_set_hash, read_set_compare, NULL, NULL);
+    transaction->ws_map = hashmap_new(sizeof(struct write_set_node), 0, 15, 460399, 
+                                            write_set_hash, write_set_compare, NULL, NULL);
+    // transaction->bloom_filter = 0;
+    transaction->state = EXECUTING;
+
+    // TODO check that this is concurrently correct
+    transaction->rv = region->global_lock;
 
     return transaction;
 }
@@ -247,9 +322,60 @@ bool tm_end(shared_t unused(shared), tx_t unused(tx)) {
  * @param target Target start address (in a private region)
  * @return Whether the whole transaction can continue
 **/
-bool tm_read(shared_t unused(shared), tx_t unused(tx), void const* unused(source), size_t unused(size), void* unused(target)) {
+bool tm_read(shared_t shared, tx_t unused(tx), void const* unused(source), size_t unused(size), void* unused(target)) {
     // TODO: tm_read(shared_t, tx_t, void const*, size_t, void*)
-    return false;
+
+    struct region *region = (struct region *)shared;
+    struct transaction *transaction = (struct transaction *)tx;
+
+    // I have to check every word
+    for(uintptr_t i=(uintptr_t)source; i<(uintptr_t)source + size; i=i+region->align){
+
+        // sample the lock associated with the word
+        struct word_lock *word_lock = hashmap_get(region->word_locks, &(struct word_lock){.addr=i});
+
+        // TODO i might want to do a bounded spinlock
+        while (!acquire_word_lock(word_lock));
+        uint64_t temp_rv = word_lock->version;
+        while(!release_word_lock(word_lock));
+
+        // I need to create a new read set node if not present in the hashmap
+        struct read_set_node *read_set_node = hashmap_get(transaction->rs_map, &(struct read_set_node){.addr = i});
+        if(read_set_node == NULL){
+            read_set_node = (struct read_set_node *)malloc(sizeof(struct read_set_node));
+            read_set_node->addr = i;
+        }
+        read_set_node->rv = temp_rv;
+        
+        // Check if the word is in the write set
+        struct write_set_node *write_set_node = hashmap_get(transaction->ws_map, &(struct write_set_node){.addr = i});
+        if(write_set_node != NULL){
+            // the word is in the write set, then I should read this value
+            memcpy(target + (i - (uintptr_t)(source)), write_set_node->value, region->align);            
+        }else{
+            // the word is not in the write set, I have to read from the region
+            // I am not looking for the correct segment, indeed I'm assuming that the user is not asking
+            // to read from a freed memory region
+            memcpy(target + (i - (uintptr_t)(source)), i, region->align);
+        }
+
+        // Check that the lock is nor taken nor changed
+        if(!acquire_word_lock(word_lock)){
+            // I have to abort the transaction
+            // TODO check if a simple return false can work
+            return false;
+        }
+        if(word_lock->version > temp_rv){
+            while(!release_word_lock(word_lock));
+            // I have to abort the transaction
+            // TODO check if a simple return false can work
+            return false;
+        }
+
+        while(!release_word_lock(word_lock));
+    }
+
+    return true;
 }
 
 /** [thread-safe] Write operation in the given transaction, source in a private region and target in the shared region.
