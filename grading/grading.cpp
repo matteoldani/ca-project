@@ -266,6 +266,8 @@ int main(int argc, char** argv) {
             auto res = ::std::thread::hardware_concurrency();
             if (unlikely(res == 0))
                 res = 16;
+            //TODO remove this shit
+            res =1;
             return static_cast<size_t>(res);
         }();
         auto const nbtxperwrk    = 200000ul / nbworkers;

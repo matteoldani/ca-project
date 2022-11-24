@@ -34,7 +34,7 @@
 #include "macros.h"
 
 #define FILTERHASH(a)                   ((UNS(a) >> 2) ^ (UNS(a) >> 5))
-#define FILTERBITS(a)                   (1 << (FILTERHASH(a) & 0x1F))
+#define FILTERBITS(a)                   (1 << (FILTERHASH(a) & 1F))
 
 
 // Required data structures
@@ -165,10 +165,17 @@ bool acquire_write_set_locks(struct region *region, struct transaction *transact
     // acquire all the locks in the write set 
     void *item;
     size_t iter = 0;
-    while(hashmap_iter(transaction->ws_map, &iter, &item)){
-        struct write_set_node * write_set_node = (struct write_set_node *)item;
-        struct word_lock *word_lock = hashmap_get(region->word_locks, &(struct word_lock){.addr = write_set_node->addr});
 
+    printf("acquire_write_set_locks: starting\n");
+    fflush(stdout);
+    while(hashmap_iter(transaction->ws_map, &iter, &item)){
+        // printf("Get the first item at address: %p\n", item);
+        // fflush(stdout);
+        struct write_set_node * write_set_node = (struct write_set_node *)item;
+        // printf("Get the write set node back: value is %p\n", write_set_node->value);
+        struct word_lock *word_lock = hashmap_get(region->word_locks, &(struct word_lock){.addr = write_set_node->addr});
+        // printf("Get the word lock with address: %p\n", word_lock);
+        // fflush(stdout);
         // if(unlikely(word_lock == NULL)){
         //     // TODO I need to release all the locks I've already taken (I guess)
         //     // This case should not happen, indeed the NULL paramenter is wrong
@@ -179,12 +186,17 @@ bool acquire_write_set_locks(struct region *region, struct transaction *transact
         // try to acquire the lock
         // maybe a bounded spin is better (like try locking multiple times before failing)
         if(!acquire_word_lock(word_lock)){
+            // printf("Failed acquiring the lock\n");
             // TODO I need to release all the locks I've already taken (I guess)
             release_write_set_locks(region, transaction, word_lock);
             return false;
         }
     }
 
+
+
+    printf("acquire_write_set_locks: all the lock acquired\n");
+    fflush(stdout);
     return true;
 
 }
@@ -235,7 +247,7 @@ uint64_t read_set_hash(const void *item, uint64_t seed0, uint64_t seed1){
 
 uint64_t word_lock_hash(const void *item, uint64_t seed0, uint64_t seed1){
     const struct word_lock *node = item;
-    return hashmap_sip(node->addr, sizeof(node->addr), seed0, seed1);
+    return hashmap_sip(node->addr, sizeof(void*), seed0, seed1);
 }
 
 // END OF HELPER FUNCTIONS FOR THE READ/WRITE SET HASHMAP
@@ -277,12 +289,14 @@ shared_t tm_create(size_t size, size_t align) {
     // Creating the word locks for this memory region
     // use calloc to initialize all the locks
     int n_locks = size / align;
+    // printf("Lock to be created: %d\n", n_locks);
     uintptr_t base_addr = (uintptr_t)region->allocs_head->segment;
     for(int i=0; i<n_locks; i++){
         struct word_lock *lock = (struct word_lock *) calloc(sizeof(struct word_lock), 1);
         lock->addr = (void *)base_addr;
-        base_addr += region->align;
+        base_addr += align;
         hashmap_set(region->word_locks, lock);
+        printf("Set lock for addr: %p\n", lock->addr);
     }
 
     memset(region->allocs_head->segment, 0, size);
@@ -332,7 +346,8 @@ void* tm_start(shared_t shared) {
     fflush(stdout);
     struct region *region = (struct region *)shared;
 
-    void *result = region->allocs_head->segment
+    void *result = region->allocs_head->segment;
+    printf("The start address is: %p\n", result);
     printf("tm_start: Ending tm_start\n");
     fflush(stdout);
     return result;
@@ -415,10 +430,11 @@ bool tm_end(shared_t shared, tx_t tx) {
 
     // Read and increment the global clock/lock
     transaction->wv = atomic_fetch_add_explicit(&(region->global_lock), 1, memory_order_release) + 1;
-
+    printf("Done the atomic fetch and add: %d\n", transaction->wv);
 
     // Special case in which rv + 1 = wv -> I don't have to validate the read set 
     if(transaction->wv != transaction->rv+1){
+        printf("I have to validate the read set\n");
         // I need to validate the read set
         void *item;
         size_t iter = 0;
@@ -466,15 +482,21 @@ bool tm_end(shared_t shared, tx_t tx) {
         }
 
     }
-
+    printf("Done validating the read set, in case it was necessary\n");
+    fflush(stdout);
     // I have to commit the changed done in the write set
     void *item;
     size_t iter = 0;
     while(hashmap_iter(transaction->ws_map, &iter, &item)){
         struct write_set_node * write_set_node = (struct write_set_node *)item;
         struct word_lock *word_lock = hashmap_get(region->word_locks, &(struct word_lock){.addr = write_set_node->addr});
-        
+        printf("Got the first node and word lock: %p %p\n", write_set_node, word_lock);
+        fflush(stdout);
+        // printf("Attemptin the mem copy of: dest: %p\tsrc: %p\tsize: %d\n", write_set_node->addr, write_set_node->value, region->align);
+        // fflush(stdout);
         memcpy(write_set_node->addr, write_set_node->value, region->align);
+        // printf("Mem copy executed\n");
+        // fflush(stdout);
         word_lock->version = transaction->wv;
         while(!release_word_lock(word_lock));
     }
@@ -493,13 +515,34 @@ bool tm_read_read_only(shared_t shared, tx_t tx, void const* source, size_t size
     struct transaction *transaction = (struct transaction *)tx;
 
     // I can mem copy since I don't need a pre valdiation
+    printf("memcpy to start: dst: %p\tsrc:%p\tsize: %d\n", target, source, size);
+    fflush(stdout);
     memcpy(target, source, size);
+    printf("memcpy excuted\n");
 
     // I have to check every word because I need to post validate
     for(uintptr_t i=(uintptr_t)source; i<(uintptr_t)source + size; i=i+region->align){
+
+
+        // dEBUD
+        size_t iter =0;
+        void* item;
+        while(hashmap_iter(region->word_locks, &iter, &item)){
+            struct word_lock *temp_word_lock = (struct word_lock*)item;
+            printf("The retrived word lock is (with addr): %p\t%p\n", temp_word_lock, temp_word_lock->addr);
+            if(temp_word_lock->addr == (void*)i){
+                printf("The word_lock retrived matched!\n");
+                printf("The hash of the word lock retrived is: %llu\n",  word_lock_hash(temp_word_lock, 15, 460399));
+                printf("The hash of the word lock wanted   is: %llu\n",  word_lock_hash(&(struct word_lock){.addr=(void *)i}, 15, 460399));
+                struct word_lock *wl = hashmap_get(region->word_locks, temp_word_lock);
+                printf("wl: %p\n", wl);
+
+            }
+        }
+
         // sample the lock associated with the word
         struct word_lock *word_lock = hashmap_get(region->word_locks, &(struct word_lock){.addr=(void *)i});
-
+        printf("Ger word lock for addr: %p\t%p\n", word_lock, i);
         // TODO i might want to do a bounded spinlock
         if (!acquire_word_lock(word_lock)){
             printf("tm_read_read_only: ending the readonly transaction\n");
@@ -563,11 +606,10 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
         if(read_set_node == NULL){
             read_set_node = (struct read_set_node *)malloc(sizeof(struct read_set_node));
             read_set_node->addr = (void *)i;
-
-            // If I had to create the node, I will put the node in the hashmap
-            hashmap_set(transaction->rs_map, read_set_node);
+            
         }
         read_set_node->rv = temp_rv;
+        hashmap_set(transaction->rs_map, read_set_node);
         
         // Check if the word is in the write set
         struct write_set_node *write_set_node = hashmap_get(transaction->ws_map, &(struct write_set_node){.addr = (void *)i});
@@ -621,7 +663,8 @@ bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* u
     // TODO: tm_write(shared_t, tx_t, void const*, size_t, void*)
 
     printf("tm_write: start the tm_write transaction\n");
-    fflush(stdout);
+    // printf("tm_write: source: %p\tsize: %d\n", source, size);
+    // fflush(stdout);
 
     struct region *region = (struct region *)shared;
     struct transaction *transaction = (struct transaction *)tx;
@@ -630,30 +673,36 @@ bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* u
     for(uintptr_t i=(uintptr_t)target; i<(uintptr_t)target + size; i=i+region->align){
 
         // check if the write set for this particular word is already present in the map
-        printf("tm_write: Getting from the hashmap\n");
-        fflush(stdout);
+        // printf("tm_write: Getting from the hashmap\n");
+        // fflush(stdout);
         struct write_set_node *write_set_node = hashmap_get(transaction->ws_map, &(struct write_set_node){.addr=(void *)i});
-        printf("tm_write: got from the hashmap\n");
-        fflush(stdout);
+        // printf("tm_write: got from the hashmap\n");
+        // fflush(stdout);
         if(write_set_node == NULL){
             // I just need to create the write set
             write_set_node = (struct write_set_node*) malloc(sizeof(struct write_set_node));
             write_set_node->addr = (void *)i;
-            write_set_node->value = NULL;
+            write_set_node->value = (void *)(malloc(sizeof(region->align)));
 
             // place the node in the hashmap 
-            printf("tm_write: setting in the hashmap\n");
-            fflush(stdout);
+            // printf("tm_write: setting in the hashmap\n");
+            // fflush(stdout);
             hashmap_set(transaction->ws_map, write_set_node);
-            printf("tm_write: set into the hashmap\n");
+            // printf("tm_write: set into the hashmap\n");
 
         } 
 
         // TODO make sure that this variable is dellocated later on
         if(write_set_node->value == NULL){
             write_set_node->value = (void *)(malloc(sizeof(region->align)));
+            // printf("The address of the value is: %p\n", write_set_node->value);
+            // fflush(stdout);
         }
-        memcpy(write_set_node->value, source+i, region->align);
+        // printf("The address of the value is: %p\n", write_set_node->value);
+        // fflush(stdout);
+        memcpy(write_set_node->value, source+(i-(uintptr_t)target), region->align);
+        // printf("The address of the value is: %p\n", write_set_node->value);
+        // fflush(stdout);
 
     }
 
