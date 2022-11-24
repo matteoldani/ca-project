@@ -301,7 +301,7 @@ int main(int argc, char** argv) {
         auto maxtick_init = Chrono::invalid_tick;
         auto maxtick_perf = Chrono::invalid_tick;
         auto maxtick_chck = Chrono::invalid_tick;
-        for (auto i = 2; i < argc; ++i) {
+        for (auto i = 3; i < argc; ++i) {
             ::std::cout << "⎧ Evaluating '" << argv[i] << "'" << (maxtick_init == Chrono::invalid_tick ? " (reference)" : "") << "..." << ::std::endl;
             // Load TM library
             TransactionalLibrary tl{argv[i]};
