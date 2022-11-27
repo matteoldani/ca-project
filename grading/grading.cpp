@@ -266,8 +266,8 @@ int main(int argc, char** argv) {
             auto res = ::std::thread::hardware_concurrency();
             if (unlikely(res == 0))
                 res = 16;
-            //TODO remove this shit
-            res =1;
+
+            res =4;
             return static_cast<size_t>(res);
         }();
         auto const nbtxperwrk    = 200000ul / nbworkers;
@@ -303,7 +303,7 @@ int main(int argc, char** argv) {
         auto maxtick_init = Chrono::invalid_tick;
         auto maxtick_perf = Chrono::invalid_tick;
         auto maxtick_chck = Chrono::invalid_tick;
-        for (auto i = 3; i < argc; ++i) {
+        for (auto i = 2; i < argc; ++i) {
             ::std::cout << "⎧ Evaluating '" << argv[i] << "'" << (maxtick_init == Chrono::invalid_tick ? " (reference)" : "") << "..." << ::std::endl;
             // Load TM library
             TransactionalLibrary tl{argv[i]};

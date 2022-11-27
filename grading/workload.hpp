@@ -306,7 +306,7 @@ public:
         for (size_t cntr = 0; cntr < nbtxperwrk; ++cntr) {
             if (long_dist(engine)) { // We roll a dice and, if "lucky", run a long transaction.
                 if (unlikely(!long_tx(count))) // If it fails, then we return an error message.
-                    return "Violated isolation or atomicity";
+                    return "Violated isolation or atomicity 1";
             } else if (alloc_dist(engine)) { // Let's roll a dice again to trigger an allocation transaction.
                 alloc_tx(alloc_trigger(engine));
             } else { // No luck with previous rolls, let's just run a short transaction.
@@ -317,7 +317,7 @@ public:
         { // Last long transaction
             size_t dummy;
             if (!long_tx(dummy))
-                return "Violated isolation or atomicity";
+                return "Violated isolation or atomicity 2";
         }
         return nullptr;
     }
