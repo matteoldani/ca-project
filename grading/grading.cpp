@@ -268,10 +268,10 @@ int main(int argc, char** argv) {
             if (unlikely(res == 0))
                 res = 16;
 
-            // res =1;
+            res = 32;
             return static_cast<size_t>(res);
         }();
-        auto const nbtxperwrk    = 200000ul / nbworkers;
+        auto const nbtxperwrk    = 20000ul / nbworkers;
         auto const nbaccounts    = 32 * nbworkers;
         auto const expnbaccounts = 256 * nbworkers;
         auto const init_balance  = 100ul;
@@ -280,7 +280,7 @@ int main(int argc, char** argv) {
         auto const nbrepeats     = 7;
         auto const seed          = static_cast<Seed>(::std::stoul(argv[1]));
         auto const clk_res       = Chrono::get_resolution();
-        auto const slow_factor   = 16ul;
+        auto const slow_factor   = 100ul;
         // Print run parameters
         ::std::cout << "⎧ #worker threads:     " << nbworkers << ::std::endl;
         ::std::cout << "⎪ #TX per worker:      " << nbtxperwrk << ::std::endl;
@@ -304,7 +304,7 @@ int main(int argc, char** argv) {
         auto maxtick_init = Chrono::invalid_tick;
         auto maxtick_perf = Chrono::invalid_tick;
         auto maxtick_chck = Chrono::invalid_tick;
-        for (auto i = 3; i < argc; ++i) {
+        for (auto i = 2; i < argc; ++i) {
             ::std::cout << "⎧ Evaluating '" << argv[i] << "'" << (maxtick_init == Chrono::invalid_tick ? " (reference)" : "") << "..." << ::std::endl;
             // Load TM library
             TransactionalLibrary tl{argv[i]};

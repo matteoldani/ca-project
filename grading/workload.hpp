@@ -177,6 +177,10 @@ private:
                 start = segment.next; // Accounts are stored in linked segments, we move to the next one.
             }
             nbaccounts = count;
+            if(sum != static_cast<Balance>(init_balance * count)){
+            printf("Sum = %ld while other is %ld\n", sum, static_cast<Balance>(init_balance * count));
+            }
+
             return sum == static_cast<Balance>(init_balance * count); // Consistency check: no money should ever be destroyed or created out of thin air.
         });
     }

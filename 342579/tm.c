@@ -70,9 +70,13 @@ struct transaction {
     uint64_t                wv; 
 };
 
+struct unpacked_word_lock{
+    bool locked;
+    uint64_t version;
+};
+
 struct word_lock {
     void                 *addr;   // word to be assigned to this lock
-    atomic_uint_fast64_t lock;    // this is the value used to check if the word is locked
     atomic_uint_fast64_t version; // this is the version of the word lock
 };
 
@@ -96,17 +100,47 @@ struct region {
 };
 
 
-static inline bool cas(atomic_uint_fast64_t *ptr, uint64_t old_value, uint64_t new_value){
-    return __sync_bool_compare_and_swap(ptr, old_value, new_value);
+static inline bool cas(atomic_uint_fast64_t *ptr, uint64_t *old_value, uint64_t new_value){
+    return atomic_compare_exchange_strong(ptr, old_value, new_value);
+}
+
+static inline void sample(struct word_lock *lock, struct unpacked_word_lock *ulock){
+    uint64_t current_version = atomic_load(&(lock->version));
+    ulock->locked = current_version >> 63;
+    ulock->version = current_version & ((1ULL << 63)-1);
 }
 
 // HELPER FUNCTIONS FOR THE WORD LOCK
-static inline bool acquire_word_lock(struct word_lock *lock){
-    return cas(&(lock->lock), 0, 1);
+static inline bool acquire_word_lock(struct word_lock *lock, struct unpacked_word_lock *ulock){
+    
+    uint64_t current_version = atomic_load(&(lock->version));
+    ulock->locked = current_version >> 63;
+    ulock->version = current_version & ((1ULL << 63)-1);
+
+    if(ulock->locked){return false;}
+
+    uint64_t new_version = current_version | (1ULL << 63);
+    return cas(&(lock->version), &current_version, new_version);
 }
 
-static inline bool release_word_lock(struct word_lock *lock){
-    return cas(&(lock->lock), 1, 0);
+static inline bool release_word_lock(struct word_lock *lock, struct unpacked_word_lock *ulock){
+
+    uint64_t current_version = atomic_load(&(lock->version));
+    
+    ulock->locked = current_version >> 63;
+    ulock->version = current_version & ((1ULL << 63)-1);
+
+    if(!ulock->locked){return false;}
+
+    uint64_t new_version = current_version & ((1ULL << 63)-1);
+    return cas(&(lock->version), &current_version, new_version);
+}
+
+static inline bool realease_word_lock_new_version(struct word_lock *lock, uint64_t new_version){
+    
+    uint64_t current_version = atomic_load(&(lock->version));
+    if(!(current_version >> 63)){return false;}
+    return cas(&(lock->version), &current_version, new_version & ((1ULL << 63)-1));
 }
 
 static inline void get_word_lock(void *addr, struct region *region, struct word_lock ** wl){
@@ -130,8 +164,8 @@ void release_write_set_locks(struct region *region, struct transaction *transact
         if(last_word_lock == word_lock){
             return;
         }
-
-        while(!release_word_lock(word_lock));      
+        struct unpacked_word_lock unpacked_word_lock;
+        while(!release_word_lock(word_lock, &unpacked_word_lock));      
     }
 }
 
@@ -142,23 +176,18 @@ void release_write_set_locks(struct region *region, struct transaction *transact
  */
 bool acquire_write_set_locks(struct region *region, struct transaction *transaction){
     
-    // printf("acquire_write_set_locks: begin\n");
-    // fflush(stdout);
     for(struct write_set_node *wsn = transaction->ws_map; wsn!=NULL; wsn=wsn->hh.next){
         struct word_lock *word_lock;
         get_word_lock(wsn->addr, region, &word_lock);
 
         // try to acquire the lock
-        if(!acquire_word_lock(word_lock)){
+        struct unpacked_word_lock unpacked_word_lock;
+        if(!acquire_word_lock(word_lock, &unpacked_word_lock)){
             release_write_set_locks(region, transaction, word_lock);
-            // printf("acquire_write_set_locks: failed\n");
-            // fflush(stdout);
             return false;
         }
         // maybe a bounded spin is better (like try locking multiple times before failing)
     }
-    // printf("acquire_write_set_locks: done\n");
-    // fflush(stdout);
     return true;
 }
 
@@ -199,7 +228,6 @@ shared_t tm_create(size_t size, size_t align) {
         for(int j=0; j<MAX_WORDS; j++){
             region->memory[i][j].addr  = (void *)malloc(region->align);
             region->memory[i][j].version = 0;
-            region->memory[i][j].lock = 0;
         }
     }
 
@@ -222,7 +250,6 @@ void tm_destroy(shared_t shared) {
     // alloc node itself
     for(int i=0; i<MAX_SEGMENTS; i++){
         for(int j=0; j<MAX_WORDS; j++){
-            
             free(region->memory[i][j].addr);
         }
     }
@@ -277,6 +304,39 @@ tx_t tm_begin(shared_t unused(shared), bool is_ro) {
     return (tx_t)transaction;
 }
 
+bool validate_read_set(struct region *region, struct transaction *transaction){
+    // I need to validate the read set
+    for(struct read_set_node *rsn = transaction->rs_map; rsn!=NULL; rsn=rsn->hh.next){
+
+        // check if the rv >= of the associated versioned write lock
+        struct word_lock *word_lock;
+        struct unpacked_word_lock ulock;
+
+        struct write_set_node *write_set_node;                            
+        HASH_FIND_PTR(transaction->ws_map, &(rsn->addr), write_set_node); 
+
+        get_word_lock(rsn->addr, region, &word_lock);
+        sample(word_lock, &ulock);
+
+        if(write_set_node != NULL){
+            if(transaction->rv < ulock.version){
+                release_write_set_locks(region, transaction, NULL);
+                free_transaction(transaction);
+                return false;
+            }
+        }else{
+            if(ulock.locked || transaction->rv < ulock.version){
+                release_write_set_locks(region, transaction, NULL);
+                free_transaction(transaction);
+                return false;
+            }
+        }
+
+    }
+
+    return true;
+}
+
 
 /** [thread-safe] End the given transaction.
  * @param shared Shared memory region associated with the transaction
@@ -284,7 +344,6 @@ tx_t tm_begin(shared_t unused(shared), bool is_ro) {
  * @return Whether the whole transaction committed
 **/
 bool tm_end(shared_t shared, tx_t tx) {
-    // TODO: tm_end(shared_t, tx_t)
 
     struct region *region = (struct region *)shared;
     struct transaction *transaction = (struct transaction*)tx;
@@ -302,50 +361,16 @@ bool tm_end(shared_t shared, tx_t tx) {
     }
 
     // Read and increment the global clock/lock
-    transaction->wv = atomic_fetch_add_explicit(&(region->global_lock), 1, memory_order_release) + 1;
+    transaction->wv = atomic_fetch_add(&(region->global_lock), 1) + 1;
+    // transaction->wv = atomic_fetch_add_explicit(&(region->global_lock), 1, memory_order_release) + 1;
 
     // Special case in which rv + 1 = wv -> I don't have to validate the read set 
     if(transaction->wv != transaction->rv+1){
-        // I need to validate the read set
-        for(struct read_set_node *rsn = transaction->rs_map; rsn!=NULL; rsn=rsn->hh.next){
-
-            // check if the rv >= of the associated versioned write lock
-            struct word_lock *word_lock;
-            get_word_lock(rsn->addr, region, &word_lock);
-
-            // check if the address is in the write set. In this case I already have the locks
-            // otherwise I have to check if the lock is free
-
-            ///////////////////////////////////////////////////////////////////////
-            // struct write_set_node *write_set_node;                            //
-            // HASH_FIND_PTR(transaction->ws_map, &(rsn->addr), write_set_node); //
-            // if(write_set_node != NULL){continue;}                             //
-            ///////////////////////////////////////////////////////////////////////
-
-            // TODO MAYBE EVEN IF I HAVE THE LOCK BECAUSE IT IS IN THE WRITE SET, THIS DOES NOT WORK SINCE MY WRITE HAS BEEN OVERWRITTEN BY ANOTHER TRANSACTION
-            // IT IS A THEORY
-
-            if(!acquire_word_lock(word_lock)){
-                // TODO I need to release all the locks I've already taken (I guess)
-                release_write_set_locks(region, transaction, NULL);
-                free_transaction(transaction);
-                return false;
-            }
-
-            if(transaction->rv < word_lock->version){
-                release_write_set_locks(region, transaction, NULL);
-                free_transaction(transaction);
-                return false;
-            }
-
-            if(!release_word_lock(word_lock)){
-                release_write_set_locks(region, transaction, NULL);
-                free_transaction(transaction);
-                return false;
-            }
-
+    //if(1){
+        if(!validate_read_set(region, transaction)){
+            free_transaction(transaction);
+            return false;
         }
-
     }
 
     // I have to commit the changed done in the write set
@@ -353,62 +378,14 @@ bool tm_end(shared_t shared, tx_t tx) {
 
         struct word_lock *word_lock;
         get_word_lock(wsn->addr, region, &word_lock);
-        // printf("tm_end: Attempting memcpy from src=%p to dest=%p\n", wsn->value, word_lock->addr);
-        // fflush(stdout);
         memcpy(word_lock->addr, wsn->value, region->align);
-        // printf("tm_end: memcpy success\n");
-        // fflush(stdout);
-        word_lock->version = transaction->wv;
-        // if(!release_word_lock(word_lock)){
-        //     printf("tm_end: end badly\n");
-        //     fflush(stdout);
-        //     return false;
-        // }
-        while(!release_word_lock(word_lock)){
-            printf("tm_end: end badly\n");
-            fflush(stdout);
-        }
-    }
-    // printf("tm_end: just before the shit\n");
-    // fflush(stdout);
-    // release_write_set_locks(region, transaction, NULL);
 
-    // printf("tm_end: end\n");
-    // fflush(stdout);
-    free_transaction(transaction);
-    return true;
-
-}
-
-bool tm_read_read_only(shared_t shared, tx_t tx, void const* source, size_t size, void* target){
-
-    struct region *region = (struct region *)shared;
-    struct transaction *transaction = (struct transaction *)tx;
-
-
-    // I have to check every word because I need to post validate
-    for(uintptr_t i=(uintptr_t)source; i<(uintptr_t)source + size; i=i+region->align){
-
-        // sample the lock associated with the word
-        struct word_lock *word_lock;
-        void *addr_i = (void*)i;
-        get_word_lock(addr_i, region, &word_lock);
-
-        memcpy(target + (i - (uintptr_t)(source)), word_lock->addr, region->align);
-
-        // TODO i might want to do a bounded spinlock
-        while (!acquire_word_lock(word_lock));
-        uint64_t temp_rv = word_lock->version;
-        
-        if(transaction->rv < temp_rv){
-            // Transaction needs to be aborted 
-            while(!release_word_lock(word_lock));
+        if(!realease_word_lock_new_version(word_lock, transaction->wv)){
             free_transaction(transaction);
             return false;
         }
-        while(!release_word_lock(word_lock));
-
     }
+    free_transaction(transaction);
     return true;
 
 }
@@ -423,15 +400,8 @@ bool tm_read_read_only(shared_t shared, tx_t tx, void const* source, size_t size
 **/
 bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* target) {
 
-    // printf("tm_read: start\n");
-    // fflush(stdout);
-
     struct region *region = (struct region *)shared;
     struct transaction *transaction = (struct transaction *)tx;
-
-    if(transaction->is_ro){
-        return tm_read_read_only(shared, tx, source, size, target);
-    }
 
     // I have to check every word
     for(uintptr_t i=(uintptr_t)source; i<(uintptr_t)source + size; i=i+region->align){
@@ -440,52 +410,44 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
         struct word_lock *word_lock;
         void *addr_i = (void*)i;
         get_word_lock(addr_i, region, &word_lock);
-
         
-        // Check if the word is in the write set        
-        struct write_set_node *write_set_node;
-        HASH_FIND_PTR(transaction->ws_map, &addr_i, write_set_node); 
-        if(write_set_node != NULL){
-            // the word is in the write set, then I should read this value
-            memcpy(target + (i - (uintptr_t)(source)), write_set_node->value, region->align);    
-            continue;        
-        }    
+        struct write_set_node *write_set_node = NULL;
+        if(!transaction->is_ro){
+            // Check if the word is in the write set        
+            HASH_FIND_PTR(transaction->ws_map, &addr_i, write_set_node); 
+            if(write_set_node != NULL){
+                // the word is in the write set, then I should read this value
+                memcpy(target + (i - (uintptr_t)(source)), write_set_node->value, region->align);
+                // continue;    
+            }  
+        } 
 
-         // I need to create a new read set node if not present in the hashmap
-        struct read_set_node *read_set_node;
-        HASH_FIND_PTR(transaction->rs_map, &addr_i, read_set_node);
-        if(read_set_node == NULL){
-            read_set_node = (struct read_set_node *)malloc(sizeof(struct read_set_node));
-            read_set_node->addr = (void *)i;
-            HASH_ADD_PTR(transaction->rs_map, addr, read_set_node);
-        }
-    
-
+        struct unpacked_word_lock ulock_pre;
+        sample(word_lock, &ulock_pre);
+        //if(write_set_node == NULL){
+            memcpy(target + (i - (uintptr_t)(source)), word_lock->addr, region->align);
+        //}
         
+        struct unpacked_word_lock ulock_post;
+        sample(word_lock, &ulock_post);
 
-        //if (!acquire_word_lock(word_lock)){return false;}
-        uint64_t pre_rv = atomic_load(&(word_lock->version));
-        //while(!release_word_lock(word_lock));
-       
-        // the word is not in the write set, I have to read from the region
-        // I am not looking for the correct segment, indeed I'm assuming that the user is not asking
-        // to read from a freed memory region
-        memcpy(target + (i - (uintptr_t)(source)), word_lock->addr, region->align);
-        uint64_t post_rv = atomic_load(&(word_lock->version));
-
-        // Check that the lock is nor taken nor changed
-        if(!acquire_word_lock(word_lock)){
-            free_transaction(transaction);
-            return false;
-        }
-        
-        if(post_rv != pre_rv || pre_rv > transaction->rv){
-            while(!release_word_lock(word_lock));
+        if((ulock_pre.version != ulock_post.version) || 
+           (ulock_pre.version > transaction->rv)|| 
+           ulock_post.locked){
             free_transaction(transaction);
             return false;
         }
 
-        while(!release_word_lock(word_lock));
+        if(!transaction->is_ro){
+            // I need to create a new read set node if not present in the hashmap
+            struct read_set_node *read_set_node;
+            HASH_FIND_PTR(transaction->rs_map, &addr_i, read_set_node);
+            if(read_set_node == NULL){
+                read_set_node = (struct read_set_node *)malloc(sizeof(struct read_set_node));
+                read_set_node->addr = (void *)i;
+                HASH_ADD_PTR(transaction->rs_map, addr, read_set_node);
+            } 
+        }
 
     }
 
@@ -522,7 +484,7 @@ bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* t
 
             // place the node in the hashmap 
             HASH_ADD_PTR(transaction->ws_map, addr, write_set_node);
-        } 
+        }
 
         memcpy(write_set_node->value, source+(i-(uintptr_t)target), align);
     }
