@@ -280,7 +280,7 @@ int main(int argc, char** argv) {
         auto const nbrepeats     = 7;
         auto const seed          = static_cast<Seed>(::std::stoul(argv[1]));
         auto const clk_res       = Chrono::get_resolution();
-        auto const slow_factor   = 100ul;
+        auto const slow_factor   = 16ul;
         // Print run parameters
         ::std::cout << "⎧ #worker threads:     " << nbworkers << ::std::endl;
         ::std::cout << "⎪ #TX per worker:      " << nbtxperwrk << ::std::endl;
@@ -305,6 +305,7 @@ int main(int argc, char** argv) {
         auto maxtick_perf = Chrono::invalid_tick;
         auto maxtick_chck = Chrono::invalid_tick;
         for (auto i = 2; i < argc; ++i) {
+            // if(i==3){continue;}
             ::std::cout << "⎧ Evaluating '" << argv[i] << "'" << (maxtick_init == Chrono::invalid_tick ? " (reference)" : "") << "..." << ::std::endl;
             // Load TM library
             TransactionalLibrary tl{argv[i]};
