@@ -268,10 +268,10 @@ int main(int argc, char** argv) {
             if (unlikely(res == 0))
                 res = 16;
 
-            res = 32;
+            res = 20;
             return static_cast<size_t>(res);
         }();
-        auto const nbtxperwrk    = 20000ul / nbworkers;
+        auto const nbtxperwrk    = 200000ul / nbworkers;
         auto const nbaccounts    = 32 * nbworkers;
         auto const expnbaccounts = 256 * nbworkers;
         auto const init_balance  = 100ul;

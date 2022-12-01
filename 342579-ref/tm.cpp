@@ -14,26 +14,31 @@
 **/
 
 // Requested features
-// #define _GNU_SOURCE
-// #define _POSIX_C_SOURCE   200809L
-// #ifdef __STDC_NO_ATOMICS__
-//     #error Current C11 compiler does not support atomic operations
-// #endif
+#define _GNU_SOURCE
+#define _POSIX_C_SOURCE   200809L
+#ifdef __STDC_NO_ATOMICS__
+    #error Current C11 compiler does not support atomic operations
+#endif
 
 // External headers
 #include <atomic>
+#include <chrono>
 #include <iostream>
 #include <map>
+#include <memory>
+#include <shared_mutex>
 #include <string.h>
+#include <tm.hpp>
 #include <unordered_set>
 #include <vector>
 // Internal headers
 #include <tm.hpp>
+
 #include "macros.h"
 
 
-#define MAX_SEGMENTS    200
-#define MAX_WORDS       7000
+#define MAX_SEGMENTS    1000
+#define MAX_WORDS       10000
 
 // Required data structures
 
@@ -43,21 +48,13 @@
  * as required by TL2
  */
 struct transaction {
-    std::map<uintptr_t, uint64_t>   ws_map; // hashmap containing the write set
+    std::map<uintptr_t, uint64_t>  ws_map; // hashmap containing the write set
     std::unordered_set<uintptr_t>   rs_map; // hashmap containing the read set
-    bool                            is_ro;  // flag to set a transacrtion as readonly
-    uint64_t                        rv;     // read version
-    uint64_t                        wv;     // write version --> used during the commit phase
+    bool                         is_ro;    // flag to set a transacrtion as readonly
+    uint64_t                     rv;
+    uint64_t                     wv; 
 };
 
-
-/**
- * The transaction is declared as a thread local variable, even thought it is not ideal,
- * due to a bug of unordered_set/map. Indeed, as explained here: 
- * https://stackoverflow.com/questions/19556554/floating-point-exception-when-storing-something-into-unordered-map
- * we can get a floating pointer exception when adding nodes into the ws/rs_map. As suggested, declaring it global
- * solves the issues.
- */
 static thread_local struct transaction transaction;
 
 
@@ -127,6 +124,7 @@ static inline bool realease_word_lock_new_version(struct word_lock *lock, uint64
     
     uint64_t current_version = lock->version.load();
     if(!(current_version >> 63)){return false;}
+    // printf("New version will be: %llu\n", new_version & ((1ULL << 63)-1));
     return lock->version.compare_exchange_strong(current_version,  new_version & ((1ULL << 63)-1));
 }
 
@@ -142,15 +140,19 @@ static inline void get_word_lock(uint64_t addr, struct region *region, struct wo
  * It will try to realease all the locks up until "last_word_lock" not included
  * If "last word lock" is set to NULL, it will unlock all the set
  **/
-void __attribute__((optimize("-O3"))) release_write_set_locks(struct region *region, struct word_lock * last_word_lock){
+void release_write_set_locks(struct region *region, struct word_lock * last_word_lock){
+
+    int i=0; 
 
     for(const auto &wsn: transaction.ws_map){
         struct word_lock *word_lock;
         get_word_lock(wsn.first, region, &word_lock);
 
         if(last_word_lock == word_lock){
+            // printf("Number of lock released = %d\n", i);
             return;
         }
+        // i++;
         struct unpacked_word_lock unpacked_word_lock;
         while(!release_word_lock(word_lock, &unpacked_word_lock));      
     }
@@ -161,7 +163,7 @@ void __attribute__((optimize("-O3"))) release_write_set_locks(struct region *reg
  * If the funcion succedes then all the locks are taken. Otherwise it will release
  * the already taken locks and return false
  */
-bool __attribute__((optimize("-O3"))) acquire_write_set_locks(struct region *region){
+bool acquire_write_set_locks(struct region *region){
     
     for(const auto &wsn: transaction.ws_map){
         struct word_lock *word_lock;
@@ -181,6 +183,12 @@ bool __attribute__((optimize("-O3"))) acquire_write_set_locks(struct region *reg
 // END OF HELPER FUNCTIONS FOR TH WORD LOCK
 
 void free_transaction(){
+
+    // free the "value"
+    // for(const auto &wsn: transaction.ws_map){
+    //     free(wsn.second);
+    // }
+
     transaction.ws_map.clear();
     transaction.rs_map.clear();
 }
@@ -191,7 +199,7 @@ void free_transaction(){
  * @param align Alignment (in bytes, must be a power of 2) that the shared memory region must support
  * @return Opaque shared memory region handle, 'invalid_shared' on failure
 **/
-shared_t __attribute__((optimize("-O3"))) tm_create(size_t size, size_t align) noexcept{
+shared_t tm_create(size_t size, size_t align) noexcept{
 
     struct region *region = (struct region *) malloc(sizeof(struct region));
     if (unlikely(!region)) {
@@ -200,7 +208,7 @@ shared_t __attribute__((optimize("-O3"))) tm_create(size_t size, size_t align) n
 
     for(int i=0; i<MAX_SEGMENTS; i++){
         for(int j=0; j<MAX_WORDS; j++){
-            region->memory[i][j].addr  = 0;
+            region->memory[i][j].addr  = 0; //(void *)malloc(region->align);
             region->memory[i][j].version = 0;
         }
     }
@@ -265,8 +273,9 @@ tx_t tm_begin(shared_t unused(shared), bool is_ro) noexcept{
     return (tx_t)&transaction;
 }
 
-bool __attribute__((optimize("-O3"))) validate_read_set(struct region *region){
-
+bool validate_read_set(struct region *region){
+    // I need to validate the read set
+    // printf("Readset vlaidation\n");
     for(const auto rsn: transaction.rs_map){
 
         // check if the rv >= of the associated versioned write lock
@@ -283,10 +292,16 @@ bool __attribute__((optimize("-O3"))) validate_read_set(struct region *region){
         get_word_lock(rsn, region, &word_lock);
         sample(word_lock, &ulock);
 
+        // if(ulock.locked || transaction.rv < ulock.version){
+        //         release_write_set_locks(region, NULL);
+        //         free_transaction();
+        //         return false;
+        //     }
+
         if(is_in_ws_map){
-            // If the address is already in the write set, then I have already acquied the lock 
-            // Thus I don't need to check it
             if(transaction.rv < ulock.version){
+                // printf("I am return false cause it was already locked but valid\n");
+                // printf("Locked: %d, transaction.rv = %llu, ulock version: %llu\n", ulock.locked, transaction.rv, ulock.version);
                 release_write_set_locks(region, NULL);
                 free_transaction();
 
@@ -294,6 +309,8 @@ bool __attribute__((optimize("-O3"))) validate_read_set(struct region *region){
             }
         }else{
             if(ulock.locked || transaction.rv < ulock.version){
+                // printf("Not in the write set but wrong\n");
+                // printf("Locked: %d, transaction.rv = %llu, ulock version: %llu\n", ulock.locked, transaction.rv, ulock.version);
                 release_write_set_locks(region, NULL);
                 free_transaction();
                 return false;
@@ -311,7 +328,7 @@ bool __attribute__((optimize("-O3"))) validate_read_set(struct region *region){
  * @param tx     Transaction to end
  * @return Whether the whole transaction committed
 **/
-bool __attribute__((optimize("-O3"))) tm_end(shared_t shared, tx_t unused(tx)) noexcept{
+bool tm_end(shared_t shared, tx_t unused(tx)) noexcept{
 
     struct region *region = (struct region *)shared;
 
@@ -323,16 +340,21 @@ bool __attribute__((optimize("-O3"))) tm_end(shared_t shared, tx_t unused(tx)) n
 
     // acquire all the locks in the write set 
     if(!acquire_write_set_locks(region)){
+        // printf("Acquisition failed with ws map of size: %d\n", transaction.ws_map.size());
+
         free_transaction();
         return false;
     }
 
     // Read and increment the global clock/lock
     transaction.wv = region->global_lock.fetch_add(1) + 1;
+    // transaction.wv = atomic_fetch_add_explicit(&(region->global_lock), 1, memory_order_release) + 1;
 
     // Special case in which rv + 1 = wv -> I don't have to validate the read set 
     if(transaction.wv != transaction.rv+1){
+    //if(1){
         if(!validate_read_set(region)){
+            // printf("Validation failed\n");
             free_transaction();
             return false;
         }
@@ -343,8 +365,10 @@ bool __attribute__((optimize("-O3"))) tm_end(shared_t shared, tx_t unused(tx)) n
         struct word_lock *word_lock;
         get_word_lock(wsn.first, region, &word_lock);
         memcpy(&(word_lock->addr), &(wsn.second), region->align);
-        if(unlikely(!realease_word_lock_new_version(word_lock, transaction.wv))){
+        // printf("Release with new version:\nTransaction wv: %llu\nTransaction rv: %llu\n", transaction.wv, transaction.rv);
+        if(!realease_word_lock_new_version(word_lock, transaction.wv)){
             free_transaction();
+            // printf("Is this case happening?\n");
             return false;
         }
     }
@@ -361,19 +385,20 @@ bool __attribute__((optimize("-O3"))) tm_end(shared_t shared, tx_t unused(tx)) n
  * @param target Target start address (in a private region)
  * @return Whether the whole transaction can continue
 **/
-bool __attribute__((optimize("-O3"))) tm_read(shared_t shared, tx_t unused(tx), void const* source, size_t size, void* target) noexcept{
+bool tm_read(shared_t shared, tx_t unused(tx), void const* source, size_t size, void* target) noexcept{
 
     struct region *region = (struct region *)shared;
-    bool is_ro = transaction.is_ro;
+    
 
     // I have to check every word
     for(uintptr_t i=(uintptr_t)source; i<(uintptr_t)source + size; i=i+region->align){
 
         // sample the lock associated with the word
         struct word_lock *word_lock;
+        void *addr_i = (void*)i;
         get_word_lock(i, region, &word_lock);
         
-        if(!is_ro){
+        if(!transaction.is_ro){
             // Check if the word is in the write set        
             auto write_set_node = (transaction.ws_map).find(i); 
             if (write_set_node != (transaction.ws_map).end()){
@@ -381,8 +406,7 @@ bool __attribute__((optimize("-O3"))) tm_read(shared_t shared, tx_t unused(tx), 
                 memcpy((void*)((uintptr_t)target + (i - (uintptr_t)(source))), &(write_set_node->second), region->align);
                 continue;    
             }  
-
-            transaction.rs_map.emplace(i);    
+            
         } 
 
         struct unpacked_word_lock ulock_pre;
@@ -393,10 +417,16 @@ bool __attribute__((optimize("-O3"))) tm_read(shared_t shared, tx_t unused(tx), 
         sample(word_lock, &ulock_post);
 
         if((ulock_pre.version != ulock_post.version) || 
-           (ulock_post.version > transaction.rv)|| 
+           (ulock_pre.version > transaction.rv)|| 
            ulock_post.locked){
             free_transaction();
             return false;
+        }
+
+        if (!transaction.is_ro)
+        {
+            /* code */
+            transaction.rs_map.emplace(i);
         }
 
     }
@@ -412,7 +442,7 @@ bool __attribute__((optimize("-O3"))) tm_read(shared_t shared, tx_t unused(tx), 
  * @param target Target start address (in the shared region)
  * @return Whether the whole transaction can continue
 **/
-bool __attribute__((optimize("-O3"))) tm_write(shared_t shared, tx_t unused(tx), void const* source, size_t size, void* target) noexcept{
+bool tm_write(shared_t shared, tx_t unused(tx), void const* source, size_t size, void* target) noexcept{
 
     struct region *region = (struct region *)shared;
     
@@ -420,6 +450,7 @@ bool __attribute__((optimize("-O3"))) tm_write(shared_t shared, tx_t unused(tx),
 
     // check every word 
     for(uintptr_t i=(uintptr_t)target; i<(uintptr_t)target + size; i=i+align){
+        transaction.ws_map[i] = 0;
         memcpy(&transaction.ws_map[i], (void*)((uintptr_t)source+(i-(uintptr_t)target)), align);
     }
 
@@ -448,6 +479,7 @@ Alloc tm_alloc(shared_t shared, tx_t unused(tx), size_t unused(size), void** tar
  * @return Whether the whole transaction can continue
 **/
 bool tm_free(shared_t unused(shared), tx_t unused(tx), void* unused(target)) noexcept {
-    // I don't need to free anything
+    // TODO: tm_free(shared_t, tx_t, void*)
+
     return true;
 }

@@ -44,7 +44,7 @@
  */
 struct transaction {
     std::map<uintptr_t, uint64_t>   ws_map; // hashmap containing the write set
-    std::unordered_set<uintptr_t>   rs_map; // hashmap containing the read set
+    std::vector<uintptr_t>          rs_map; // hashmap containing the read set
     bool                            is_ro;  // flag to set a transacrtion as readonly
     uint64_t                        rv;     // read version
     uint64_t                        wv;     // write version --> used during the commit phase
@@ -305,6 +305,28 @@ bool __attribute__((optimize("-O3"))) validate_read_set(struct region *region){
     return true;
 }
 
+bool __attribute__((optimize("-O3"))) validate_read_set_read_only(struct region *region){
+
+    for(const auto rsn: transaction.rs_map){
+
+        // check if the rv >= of the associated versioned write lock
+        struct word_lock *word_lock;
+        struct unpacked_word_lock ulock;
+
+        // printf("Is in map: %d\n", is_in_ws_map);
+
+        get_word_lock(rsn, region, &word_lock);
+        sample(word_lock, &ulock);
+
+        if(ulock.locked || transaction.rv < ulock.version){
+            free_transaction();
+            return false;
+        }
+    }
+
+    return true;
+}
+
 
 /** [thread-safe] End the given transaction.
  * @param shared Shared memory region associated with the transaction
@@ -353,6 +375,47 @@ bool __attribute__((optimize("-O3"))) tm_end(shared_t shared, tx_t unused(tx)) n
 
 }
 
+bool __attribute__((optimize("-O3"))) tm_read_only(shared_t shared, void const* source, size_t size, void* target){
+    struct region *region = (struct region *)shared;
+
+    // I have to check every word
+    for(uintptr_t i=(uintptr_t)source; i<(uintptr_t)source + size; i=i+region->align){
+
+        // sample the lock associated with the word
+        struct word_lock *word_lock;
+        get_word_lock(i, region, &word_lock);
+        
+
+        struct unpacked_word_lock ulock_post;
+        memcpy((void*)((uintptr_t)target + (i - (uintptr_t)(source))), &(word_lock->addr), region->align);
+        sample(word_lock, &ulock_post);
+
+        if( (ulock_post.version > transaction.rv)|| ulock_post.locked){
+
+            // before abortion try to valdiate the readset. In case it is valid, then update the transanctoin rv 
+            if(validate_read_set_read_only(region)){
+                struct unpacked_word_lock ulock_fianl;
+                memcpy((void*)((uintptr_t)target + (i - (uintptr_t)(source))), &(word_lock->addr), region->align);
+                sample(word_lock, &ulock_fianl);
+
+                if(ulock_fianl.version == ulock_post.version && !ulock_fianl.locked){
+                   transaction.rv = ulock_fianl.version;     
+                   transaction.rs_map.push_back(i);
+                   continue;
+                }
+            }
+            free_transaction();
+            return false;
+        }
+
+        transaction.rs_map.push_back(i);
+
+    }
+
+    return true;
+
+}
+
 /** [thread-safe] Read operation in the given transaction, source in the shared region and target in a private region.
  * @param shared Shared memory region associated with the transaction
  * @param tx     Transaction to use
@@ -363,8 +426,12 @@ bool __attribute__((optimize("-O3"))) tm_end(shared_t shared, tx_t unused(tx)) n
 **/
 bool __attribute__((optimize("-O3"))) tm_read(shared_t shared, tx_t unused(tx), void const* source, size_t size, void* target) noexcept{
 
+
+    if(transaction.is_ro){
+        return tm_read_only(shared, source, size, target);
+    }
+
     struct region *region = (struct region *)shared;
-    bool is_ro = transaction.is_ro;
 
     // I have to check every word
     for(uintptr_t i=(uintptr_t)source; i<(uintptr_t)source + size; i=i+region->align){
@@ -373,17 +440,15 @@ bool __attribute__((optimize("-O3"))) tm_read(shared_t shared, tx_t unused(tx), 
         struct word_lock *word_lock;
         get_word_lock(i, region, &word_lock);
         
-        if(!is_ro){
-            // Check if the word is in the write set        
-            auto write_set_node = (transaction.ws_map).find(i); 
-            if (write_set_node != (transaction.ws_map).end()){
-                // the word is in the write set, then I should read this value
-                memcpy((void*)((uintptr_t)target + (i - (uintptr_t)(source))), &(write_set_node->second), region->align);
-                continue;    
-            }  
-
-            transaction.rs_map.emplace(i);    
-        } 
+        
+        // Check if the word is in the write set        
+        auto write_set_node = (transaction.ws_map).find(i); 
+        if (write_set_node != (transaction.ws_map).end()){
+            // the word is in the write set, then I should read this value
+            memcpy((void*)((uintptr_t)target + (i - (uintptr_t)(source))), &(write_set_node->second), region->align);
+            continue;    
+        }  
+    
 
         struct unpacked_word_lock ulock_pre;
         struct unpacked_word_lock ulock_post;
@@ -398,6 +463,8 @@ bool __attribute__((optimize("-O3"))) tm_read(shared_t shared, tx_t unused(tx), 
             free_transaction();
             return false;
         }
+
+        transaction.rs_map.push_back(i);   
 
     }
 
