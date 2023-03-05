@@ -1,5 +1,9 @@
 # CS-453 - Course project
 
+The repo holds my implementation of the project proposed in CS-453 (Concurrent Algorithm) at EPFL. The aim of the project is the implementation of a transaction memory. My implementation of Transactional Locking II is in `tl2`. 
+
+## Description
+
 The [project description](https://dcl.epfl.ch/site/_media/education/ca-project.pdf) is available on [Moodle](https://moodle.epfl.ch/course/view.php?id=14334) and the [website of the course](https://dcl.epfl.ch/site/education/ca_2021).
 
 The description includes:
